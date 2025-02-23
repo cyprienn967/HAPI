@@ -40,7 +40,6 @@ class LlamaChat7B:
 
             for attempt in range(max_attempts):
                 sampled_index = torch.multinomial(probs, num_samples=1)  # shape: (1, 1)
-                # Extract scalar index from sampled_index to avoid extra dimensions
                 sampled_index_scalar = sampled_index.item()
                 token_id = top_k_indices[0, sampled_index_scalar].unsqueeze(0)  # shape: (1,)
 

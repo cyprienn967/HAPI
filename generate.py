@@ -35,7 +35,7 @@ model = LlamaForCausalLM.from_pretrained(
 print("Loading Hallucination Classifier...")
 classifier = HAPIClassifier(CLASSIFIER_PATH, device=device)
 
-# Read prompts from file
+# Read prompts from file (each line is one prompt)
 with open(PROMPTS_FILE, "r", encoding="utf-8") as f:
     prompts = [line.strip() for line in f.readlines() if line.strip()]
 
@@ -64,6 +64,7 @@ def generate_sentence(context, sentence_max_length=60):
     Generates a new sentence using the current context.
     Only new tokens (up to sentence_max_length) are generated via max_new_tokens.
     If more than one sentence is produced, only the first sentence is returned.
+    This function ensures the generated sentence is smooth and ends with proper punctuation.
     """
     inputs = tokenizer(context, return_tensors="pt").to(model.device)
     output_ids = model.generate(
@@ -73,9 +74,19 @@ def generate_sentence(context, sentence_max_length=60):
         top_k=50,
     )
     sentence = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    # If the generation contains more than one sentence, keep only the first.
+    
+    # Remove the context from the generated text if accidentally included
+    if sentence.startswith(context):
+        sentence = sentence[len(context):].strip()
+        
+    # Split into sentences and take the first complete sentence
     if ". " in sentence:
         sentence = sentence.split(". ")[0] + "."
+    else:
+        # If no sentence boundary is found, ensure sentence ends with punctuation.
+        if sentence and sentence[-1] not in ".!?":
+            sentence += "."
+    
     return sentence.strip()
 
 
@@ -112,6 +123,7 @@ def generate_with_hallucination_filtering(prompt, classifier, desired_word_count
     while len(" ".join(generated_sentences).split()) < desired_word_count:
         sentence = generate_sentence(context, sentence_max_length=sentence_max_length)
         attempts = 0
+        
         # Regenerate the sentence until it is not flagged (or until max attempts)
         while sentence_contains_hallucination(sentence, classifier, prompt) and attempts < max_regen_attempts:
             print(f"🔴 Hallucination detected in sentence: '{sentence}'. Regenerating sentence (attempt {attempts+1})...")
@@ -119,7 +131,6 @@ def generate_with_hallucination_filtering(prompt, classifier, desired_word_count
             sentence = generate_sentence(context, sentence_max_length=sentence_max_length)
             attempts += 1
 
-        # Append the accepted sentence to the result and update context.
         generated_sentences.append(sentence)
         context += " " + sentence
 
@@ -140,15 +151,15 @@ def generate_full_text(prompt, max_length=400):
     return tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
 
-# Loop through prompts and generate outputs
+# Process each prompt: generate a baseline response and a filtered (hallucination-checked) response.
 for i, prompt in enumerate(prompts):
     try:
         print(f"({i+1}/{len(prompts)}) Generating for prompt: {prompt}")
 
-        # Generate baseline output without filtering.
+        # Baseline generation without hallucination filtering.
         baseline_output = generate_full_text(prompt, max_length=400)
 
-        # Generate filtered output using the sentence-by-sentence approach.
+        # Generation with real-time hallucination detection (sentence-by-sentence regeneration).
         filtered_output, hallucinations = generate_with_hallucination_filtering(
             prompt, classifier, desired_word_count=250, sentence_max_length=60, max_regen_attempts=5
         )
