@@ -47,3 +47,16 @@ class HAPIClassifier(nn.Module):
             output = self.model(token_tensor)
             prediction = torch.argmax(output, dim=1).item()
         return prediction == 1  # 1 means hallucination, 0 means valid
+
+    def get_hallucination_score(self, token_tensor):
+        """
+        Returns the probability (between 0 and 1) that the token is hallucinated.
+        Lower scores are better (more likely valid).
+        """
+        token_tensor = token_tensor.to(self.device).float()
+        with torch.no_grad():
+            output = self.model(token_tensor)
+            probs = torch.softmax(output, dim=1)
+            # index 1 corresponds to hallucination probability
+            score = probs[0, 1].item()
+        return score

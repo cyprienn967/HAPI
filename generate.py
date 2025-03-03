@@ -44,7 +44,6 @@ baseline_results = []
 filtered_results = []
 flagged_hallucinations = []
 
-
 def extract_hidden_states(input_ids):
     """
     Extracts and concatenates the representations of the last token from the last two hidden layers.
@@ -58,13 +57,9 @@ def extract_hidden_states(input_ids):
         concatenated = torch.cat((last_layer, second_last_layer), dim=1)
     return concatenated
 
-
-def generate_sentence(context, sentence_max_length=60):
+def generate_sentence_candidates(context, sentence_max_length=60, num_candidates=3):
     """
-    Generates a new sentence using the current context.
-    Only new tokens (up to sentence_max_length) are generated via max_new_tokens.
-    If more than one sentence is produced, only the first sentence is returned.
-    This function ensures the generated sentence is smooth and ends with proper punctuation.
+    Generates multiple candidate sentences using the provided context.
     """
     inputs = tokenizer(context, return_tensors="pt").to(model.device)
     output_ids = model.generate(
@@ -72,75 +67,88 @@ def generate_sentence(context, sentence_max_length=60):
         max_new_tokens=sentence_max_length,
         do_sample=True,
         top_k=50,
+        num_return_sequences=num_candidates,
     )
-    sentence = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    
-    # Remove the context from the generated text if accidentally included
-    if sentence.startswith(context):
-        sentence = sentence[len(context):].strip()
-        
-    # Split into sentences and take the first complete sentence
-    if ". " in sentence:
-        sentence = sentence.split(". ")[0] + "."
-    else:
-        # If no sentence boundary is found, ensure sentence ends with punctuation.
-        if sentence and sentence[-1] not in ".!?":
-            sentence += "."
-    
-    return sentence.strip()
+    candidates = []
+    for i in range(num_candidates):
+        sentence = tokenizer.decode(output_ids[i], skip_special_tokens=True)
+        # Remove the context from the generated text if accidentally included
+        if sentence.startswith(context):
+            sentence = sentence[len(context):].strip()
+        # Split into sentences and take the first complete sentence
+        if ". " in sentence:
+            sentence = sentence.split(". ")[0] + "."
+        else:
+            if sentence and sentence[-1] not in ".!?":
+                sentence += "."
+        candidates.append(sentence.strip())
+    return candidates
 
-
-def sentence_contains_hallucination(sentence, classifier, original_prompt):
+def compute_sentence_hallucination_score(sentence, classifier, original_prompt):
     """
-    Checks a sentence token-by-token for hallucinations.
-    Before checking, any occurrence of the original prompt (and newlines) is stripped out.
-    Returns True if any token in the sentence is flagged by the classifier.
+    Computes an average hallucination score for a sentence by token.
+    Lower scores mean less likely to be hallucinated.
     """
+    # Remove the original prompt and newlines from the sentence.
     stripped_sentence = sentence.replace(original_prompt, "").replace("\n", " ").strip()
     tokens = stripped_sentence.split()
+    if not tokens:
+        return 0.0  # No tokens means no hallucination.
+    total_score = 0.0
     for token in tokens:
         token_tensor = tokenizer(token, return_tensors="pt").input_ids.to(model.device)
         hidden_state = extract_hidden_states(token_tensor)
-        if classifier.classify(hidden_state):
-            return True
-    return False
+        score = classifier.get_hallucination_score(hidden_state)
+        total_score += score
+    avg_score = total_score / len(tokens)
+    return avg_score
 
-
-def generate_with_hallucination_filtering(prompt, classifier, desired_word_count=250, sentence_max_length=60, max_regen_attempts=5):
+def generate_with_hallucination_filtering(prompt, classifier, desired_word_count=250, sentence_max_length=60, max_regen_attempts=5, num_candidates=3, threshold=0.5):
     """
-    Generates a passage sentence-by-sentence.
-    
-    - The first sentence is generated using the prompt.
-    - Each generated sentence is checked for hallucinations.
-    - If a sentence is flagged, that sentence is regenerated (up to max_regen_attempts).
-    - Accepted sentences are appended to the context, so subsequent sentences are generated with full context.
-    - The process repeats until the generated passage reaches the desired word count.
+    Generates a passage sentence-by-sentence with real-time hallucination filtering.
+    For each sentence, multiple candidate sentences are generated.
+    The candidate with the lowest hallucination score (below threshold) is chosen.
+    If no candidate meets the threshold within max_regen_attempts, the best candidate is used.
     """
     context = prompt
     generated_sentences = []
     hallucinated_sentences = []  # For logging purposes
 
     while len(" ".join(generated_sentences).split()) < desired_word_count:
-        sentence = generate_sentence(context, sentence_max_length=sentence_max_length)
         attempts = 0
-        
-        # Regenerate the sentence until it is not flagged (or until max attempts)
-        while sentence_contains_hallucination(sentence, classifier, prompt) and attempts < max_regen_attempts:
-            print(f"🔴 Hallucination detected in sentence: '{sentence}'. Regenerating sentence (attempt {attempts+1})...")
-            hallucinated_sentences.append(sentence)
-            sentence = generate_sentence(context, sentence_max_length=sentence_max_length)
-            attempts += 1
+        selected_sentence = None
+        best_score = float('inf')
+        best_candidate = None
 
-        generated_sentences.append(sentence)
-        context += " " + sentence
+        while attempts < max_regen_attempts:
+            candidates = generate_sentence_candidates(context, sentence_max_length, num_candidates)
+            for sentence in candidates:
+                score = compute_sentence_hallucination_score(sentence, classifier, prompt)
+                # Save best candidate seen so far.
+                if score < best_score:
+                    best_score = score
+                    best_candidate = sentence
+            # If the best candidate is acceptable, choose it.
+            if best_score < threshold:
+                selected_sentence = best_candidate
+                break
+            else:
+                print(f"🔴 Attempt {attempts+1}: Best candidate score {best_score:.3f} not below threshold {threshold}. Regenerating...")
+                hallucinated_sentences.append(best_candidate)
+                attempts += 1
+
+        # If after max attempts no candidate is below threshold, use the best candidate.
+        if selected_sentence is None:
+            selected_sentence = best_candidate
+        generated_sentences.append(selected_sentence)
+        context += " " + selected_sentence
 
         # Safety check: if generation stalls (empty sentence), break.
-        if not sentence.strip():
+        if not selected_sentence.strip():
             break
 
     generated_text = " ".join(generated_sentences)
     return generated_text, hallucinated_sentences
-
 
 def generate_full_text(prompt, max_length=400):
     """
@@ -150,7 +158,6 @@ def generate_full_text(prompt, max_length=400):
     output_ids = model.generate(**inputs, max_length=max_length)
     return tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
-
 # Process each prompt: generate a baseline response and a filtered (hallucination-checked) response.
 for i, prompt in enumerate(prompts):
     try:
@@ -159,9 +166,9 @@ for i, prompt in enumerate(prompts):
         # Baseline generation without hallucination filtering.
         baseline_output = generate_full_text(prompt, max_length=400)
 
-        # Generation with real-time hallucination detection (sentence-by-sentence regeneration).
+        # Generation with real-time hallucination detection (sentence-by-sentence regeneration with candidate re-ranking).
         filtered_output, hallucinations = generate_with_hallucination_filtering(
-            prompt, classifier, desired_word_count=250, sentence_max_length=60, max_regen_attempts=5
+            prompt, classifier, desired_word_count=250, sentence_max_length=60, max_regen_attempts=5, num_candidates=3, threshold=0.5
         )
 
         baseline_results.append(f"PROMPT: {prompt}\nBASELINE OUTPUT:\n{baseline_output}\n")
