@@ -84,24 +84,27 @@ def generate_sentence_candidates(context, sentence_max_length=60, num_candidates
         candidates.append(sentence.strip())
     return candidates
 
-def compute_sentence_hallucination_score(sentence, classifier, original_prompt):
+def compute_batch_hallucination_scores(candidates, classifier):
     """
-    Computes an average hallucination score for a sentence by token.
-    Lower scores mean less likely to be hallucinated.
+    Computes the hallucination scores for a batch of candidate sentences using only the final token’s hidden state.
+    This function tokenizes all candidate sentences together, runs them through the model in one forward pass,
+    and then computes the hallucination score for each candidate.
     """
-    # Remove the original prompt and newlines from the sentence.
-    stripped_sentence = sentence.replace(original_prompt, "").replace("\n", " ").strip()
-    tokens = stripped_sentence.split()
-    if not tokens:
-        return 0.0  # No tokens means no hallucination.
-    total_score = 0.0
-    for token in tokens:
-        token_tensor = tokenizer(token, return_tensors="pt").input_ids.to(model.device)
-        hidden_state = extract_hidden_states(token_tensor)
-        score = classifier.get_hallucination_score(hidden_state)
-        total_score += score
-    avg_score = total_score / len(tokens)
-    return avg_score
+    # Tokenize candidates as a batch with padding/truncation.
+    inputs = tokenizer(candidates, return_tensors="pt", padding=True, truncation=True).to(model.device)
+    with torch.no_grad():
+        outputs = model(**inputs, output_hidden_states=True)
+    # Extract the last token hidden state for each candidate from the last two layers.
+    last_hidden = outputs.hidden_states[-1][:, -1, :]
+    second_last_hidden = outputs.hidden_states[-2][:, -1, :]
+    concatenated = torch.cat((last_hidden, second_last_hidden), dim=1)
+    # Pass the batch through the classifier to get probabilities.
+    with torch.no_grad():
+        logits = classifier.model(concatenated.to(classifier.device).float())
+        probs = torch.softmax(logits, dim=1)
+        # Extract hallucination probability (index 1) for each candidate.
+        scores = probs[:, 1].tolist()
+    return scores
 
 def generate_with_hallucination_filtering(prompt, classifier, desired_word_count=250, sentence_max_length=60, max_regen_attempts=5, num_candidates=3, threshold=0.5):
     """
@@ -122,9 +125,8 @@ def generate_with_hallucination_filtering(prompt, classifier, desired_word_count
 
         while attempts < max_regen_attempts:
             candidates = generate_sentence_candidates(context, sentence_max_length, num_candidates)
-            for sentence in candidates:
-                score = compute_sentence_hallucination_score(sentence, classifier, prompt)
-                # Save best candidate seen so far.
+            scores = compute_batch_hallucination_scores(candidates, classifier)
+            for sentence, score in zip(candidates, scores):
                 if score < best_score:
                     best_score = score
                     best_candidate = sentence
@@ -166,7 +168,7 @@ for i, prompt in enumerate(prompts):
         # Baseline generation without hallucination filtering.
         baseline_output = generate_full_text(prompt, max_length=400)
 
-        # Generation with real-time hallucination detection (sentence-by-sentence regeneration with candidate re-ranking).
+        # Generation with real-time hallucination detection (sentence-by-sentence regeneration with batched candidate re-ranking).
         filtered_output, hallucinations = generate_with_hallucination_filtering(
             prompt, classifier, desired_word_count=250, sentence_max_length=60, max_regen_attempts=5, num_candidates=3, threshold=0.5
         )
